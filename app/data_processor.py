@@ -16,7 +16,194 @@ try:
 except ImportError:
     cv2 = None
     print("Warning: OpenCV not available. Image processing will be limited.")
+# أضف هذا الكود في app/data_processor.py بعد الـ imports
 
+class ImageDataLoaderEfficientNet:
+    """
+    محمل بيانات محسّن لـ EfficientNetV2
+    """
+    
+    def __init__(self, img_size=(256, 256), batch_size=16):
+        self.img_size = img_size
+        self.batch_size = batch_size
+    
+    def load_image_dataset(self, data_dir, validation_split=0.2, seed=42):
+        """
+        تحميل مجموعة صور من مجلد
+        """
+        try:
+            # تحميل مجموعة التدريب
+            train_ds = tf.keras.utils.image_dataset_from_directory(
+                data_dir,
+                validation_split=validation_split,
+                subset="training",
+                seed=seed,
+                image_size=self.img_size,
+                batch_size=self.batch_size,
+                label_mode='categorical'
+            )
+            
+            # تحميل مجموعة التحقق
+            val_ds = tf.keras.utils.image_dataset_from_directory(
+                data_dir,
+                validation_split=validation_split,
+                subset="validation",
+                seed=seed,
+                image_size=self.img_size,
+                batch_size=self.batch_size,
+                label_mode='categorical'
+            )
+            
+            class_names = train_ds.class_names
+            
+            return train_ds, val_ds, class_names
+        
+        except Exception as e:
+            raise Exception(f"Error loading image dataset: {str(e)}")
+    
+    def apply_augmentation(self, dataset):
+        """
+        تطبيق Data Augmentation
+        """
+        data_augmentation = tf.keras.Sequential([
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.15),
+            tf.keras.layers.RandomZoom(0.1),
+            tf.keras.layers.RandomContrast(0.2),
+            tf.keras.layers.RandomBrightness(0.2)
+        ])
+        
+        def augment_batch(images, labels):
+            return data_augmentation(images, training=True), labels
+        
+        dataset = dataset.map(augment_batch, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        
+        return dataset
+    
+    def prepare_dataset(self, dataset, augment=False):
+        """
+        تحضير dataset نهائي
+        """
+        if augment:
+            dataset = self.apply_augmentation(dataset)
+        else:
+            dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        
+        return dataset
+
+# ============================================================
+# تعديل في دالة process_file الموجودة
+# ============================================================
+
+# إضافة هذا الشرط في البداية:
+def process_file(self, filepath, session_id=None):
+    """
+    معالجة الملف المرفوع
+    """
+    file_extension = os.path.splitext(filepath)[1].lower()
+    
+    if file_extension == '.csv':
+        return self._process_csv(filepath)
+    elif file_extension in ['.zip']:
+        return self._process_image_zip(filepath, session_id)
+    elif file_extension in ['.png', '.jpg', '.jpeg']:
+        return self._process_single_image(filepath, session_id)
+    else:
+        raise ValueError(f"Unsupported file format: {file_extension}")
+
+# ============================================================
+# إصلاح _process_image_zip
+# ============================================================
+
+# تأكد من أن _process_image_zip يحفظ المسار:
+def _process_image_zip(self, filepath, session_id=None):
+    """معالجة ZIP يحتوي على صور - محسّن"""
+    try:
+        extract_path = filepath.replace('.zip', '_extracted')
+        os.makedirs(extract_path, exist_ok=True)
+        
+        # فك الضغط
+        with zipfile.ZipFile(filepath, 'r') as zip_ref:
+            zip_ref.extractall(extract_path)
+        
+        # البحث عن الصور
+        image_files = []
+        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
+        
+        for root, dirs, files in os.walk(extract_path):
+            for file in files:
+                if os.path.splitext(file)[1].lower() in image_extensions:
+                    image_files.append(os.path.join(root, file))
+        
+        if not image_files:
+            raise Exception("No image files found in ZIP archive")
+        
+        # الكشف عن الفئات
+        classes = set()
+        for img_path in image_files:
+            parent_dir = os.path.basename(os.path.dirname(img_path))
+            if parent_dir != os.path.basename(extract_path):
+                classes.add(parent_dir)
+        
+        if session_id is None:
+            session_id = os.path.basename(filepath).split('_')[0]
+        
+        # اختيار عينات عشوائية
+        sample_images = []
+        max_samples = min(8, len(image_files))
+        
+        if classes and len(classes) > 1:
+            images_by_class = {}
+            for img_path in image_files:
+                class_name = os.path.basename(os.path.dirname(img_path))
+                if class_name != os.path.basename(extract_path):
+                    if class_name not in images_by_class:
+                        images_by_class[class_name] = []
+                    images_by_class[class_name].append(img_path)
+            
+            images_per_class = max(1, max_samples // len(classes))
+            for class_name, class_images in images_by_class.items():
+                sample_size = min(images_per_class, len(class_images))
+                selected = random.sample(class_images, sample_size)
+                
+                for img_path in selected:
+                    if len(sample_images) >= max_samples:
+                        break
+                    filename = os.path.basename(img_path)
+                    sample_images.append({
+                        'url': f'/api/preview-image/{session_id}/{filename}',
+                        'label': class_name
+                    })
+        else:
+            selected_paths = random.sample(image_files, max_samples)
+            for i, img_path in enumerate(selected_paths):
+                filename = os.path.basename(img_path)
+                class_label = os.path.basename(os.path.dirname(img_path)) if classes else f'Image {i+1}'
+                sample_images.append({
+                    'url': f'/api/preview-image/{session_id}/{filename}',
+                    'label': class_label
+                })
+        
+        preview_data = {
+            'type': 'images',
+            'count': len(image_files),
+            'classes': len(classes) if classes else None,
+            'class_names': list(classes) if classes else None,
+            'samples': sample_images,
+            'extract_path': extract_path,  # ✅ حفظ المسار
+            'use_generator': len(image_files) > self.max_images_in_memory,
+            'memory_info': {
+                'max_images_in_memory': self.max_images_in_memory,
+                'estimated_memory_gb': len(image_files) * 256 * 256 * 3 * 4 / (1024**3),
+                'will_use_generator': len(image_files) > self.max_images_in_memory
+            }
+        }
+        
+        return preview_data
+    
+    except Exception as e:
+        raise Exception(f"Error processing image ZIP: {str(e)}")
 class ImageDataGenerator(Sequence):
     """Memory-efficient image data generator for large datasets"""
     

@@ -12,7 +12,9 @@ from io import BytesIO
 
 # Import TensorFlow first
 import tensorflow as tf
-
+import numpy as np
+from app.efficientnet_trainer import EfficientNetV2Trainer
+from app.gradcam_generator import GradCAMGenerator
 # Import our custom modules
 from app.data_processor import DataProcessor
 from app.model_builder import ModelBuilder
@@ -1148,6 +1150,404 @@ def compare_models():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/train-efficientnet', methods=['POST'])
+def train_efficientnet():
+    """
+    تدريب نموذج EfficientNetV2
+    """
+    global training_state
+    
+    try:
+        data = request.get_json()
+        config = data.get('config', {})
+        data_info = data.get('dataInfo', {})
+        
+        # فحص صحة الـ config
+        if not config or not data_info:
+            return jsonify({'error': 'Missing configuration or data info'}), 400
+        
+        # التحقق من أن البيانات صور
+        if data_info.get('data_type') != 'images':
+            return jsonify({'error': 'EfficientNetV2 requires image data'}), 400
+        
+        # إعادة تعيين حالة التدريب
+        training_state = {
+            'status': 'training',
+            'progress': 0,
+            'epoch': 0,
+            'history': [],
+            'model': None,
+            'results': None,
+            'error_message': None,
+            'current_phase': 1
+        }
+        
+        # بدء التدريب في thread منفصل
+        training_thread = threading.Thread(
+            target=train_efficientnet_background,
+            args=(config, data_info)
+        )
+        training_thread.daemon = True
+        training_thread.start()
+        
+        return jsonify({'message': 'EfficientNetV2 training started successfully'})
+    
+    except Exception as e:
+        training_state['status'] = 'error'
+        training_state['error_message'] = str(e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/compute-gradcam', methods=['POST'])
+def compute_gradcam():
+    """
+    حساب Grad-CAM للصور
+    """
+    try:
+        data = request.get_json()
+        session_id = data.get('session_id')
+        
+        if not session_id:
+            return jsonify({'error': 'Session ID required'}), 400
+        
+        if training_state['status'] != 'completed' or training_state['model'] is None:
+            return jsonify({'error': 'No trained model available'}), 400
+        
+        # حفظ النموذج مؤقتاً
+        temp_model_path = os.path.join(app.config['MODELS_FOLDER'], f'temp_model_{session_id}')
+        os.makedirs(temp_model_path, exist_ok=True)
+        training_state['model'].save(temp_model_path)
+        
+        # بدء حساب Grad-CAM في thread
+        gradcam_thread = threading.Thread(
+            target=compute_gradcam_background,
+            args=(session_id, temp_model_path)
+        )
+        gradcam_thread.daemon = True
+        gradcam_thread.start()
+        
+        return jsonify({
+            'message': 'Grad-CAM computation started',
+            'status': 'computing'
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/gradcam-status/<session_id>', methods=['GET'])
+def get_gradcam_status(session_id):
+    """
+    الحصول على حالة Grad-CAM
+    """
+    try:
+        gradcam_dir = os.path.join(app.config['MODELS_FOLDER'], f'gradcam_{session_id}')
+        json_path = os.path.join(gradcam_dir, 'gradcam_data.json')
+        
+        if os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                gradcam_data = json.load(f)
+            
+            return jsonify({
+                'status': 'completed',
+                'data': gradcam_data
+            })
+        else:
+            return jsonify({
+                'status': 'computing',
+                'message': 'Still computing Grad-CAM...'
+            })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ====================================================
+# BACKGROUND TRAINING FUNCTION
+# ====================================================
+
+def train_efficientnet_background(config, data_info):
+    """
+    دالة خلفية لتدريب EfficientNetV2
+    """
+    global training_state
+    
+    try:
+        print("🚀 Starting EfficientNetV2 training...")
+        
+        # حصول على معلومات الجلسة
+        session_id = data_info.get('session_id') or data_info.get('preview', {}).get('session_id')
+        if not session_id:
+            raise Exception("Session ID not found")
+        
+        # تحميل البيانات
+        extract_path = data_info.get('preview', {}).get('extract_path')
+        if not extract_path or not os.path.exists(extract_path):
+            raise Exception("Extract path not found")
+        
+        # إعداد البيانات
+        img_size = (256, 256)
+        batch_size = config.get('batchSize', 16)
+        validation_split = config.get('validationSplit', 0.2)
+        
+        # تحميل البيانات
+        train_ds = tf.keras.utils.image_dataset_from_directory(
+            extract_path,
+            validation_split=validation_split,
+            subset="training",
+            seed=42,
+            image_size=img_size,
+            batch_size=batch_size,
+            label_mode='categorical'
+        )
+        
+        val_ds = tf.keras.utils.image_dataset_from_directory(
+            extract_path,
+            validation_split=validation_split,
+            subset="validation",
+            seed=42,
+            image_size=img_size,
+            batch_size=batch_size,
+            label_mode='categorical'
+        )
+        
+        class_names = train_ds.class_names
+        num_classes = len(class_names)
+        
+        print(f"📊 Classes: {class_names}")
+        print(f"📁 Training samples: {len(train_ds)}")
+        print(f"📁 Validation samples: {len(val_ds)}")
+        
+        # تحضير البيانات
+        trainer = EfficientNetV2Trainer(img_size=img_size, num_classes=num_classes)
+        train_ds_augmented = trainer.prepare_dataset(train_ds, augment=True)
+        val_ds_prepared = trainer.prepare_dataset(val_ds, augment=False)
+        
+        # بناء النموذج
+        print("\n🏗️  Building model...")
+        model, base_model = trainer.build_model()
+        model = trainer.compile_model(model, learning_rate=config.get('learningRate', 1e-3))
+        
+        # Callback مخصص لتحديث الحالة
+        class TrainingStateCallback(keras.callbacks.Callback):
+            def __init__(self, phase):
+                self.phase = phase
+                self.epoch_count = 0
+                self.start_time = time.time()
+            
+            def on_epoch_end(self, epoch, logs=None):
+                self.epoch_count += 1
+                logs = logs or {}
+                
+                training_state['epoch'] = self.epoch_count
+                training_state['current_phase'] = self.phase
+                
+                # حساب التقدم
+                total_epochs = config.get('epochs', 50)
+                if self.phase == 2:
+                    total_epochs = config.get('epochs', 50) + config.get('phase2_epochs', 25)
+                
+                training_state['progress'] = (training_state['epoch'] / total_epochs) * 100
+                
+                # إضافة إلى history
+                history_entry = {
+                    'epoch': training_state['epoch'],
+                    'phase': self.phase,
+                    'loss': float(logs.get('loss', 0)),
+                    'accuracy': float(logs.get('accuracy', 0)),
+                    'val_loss': float(logs.get('val_loss', 0)),
+                    'val_accuracy': float(logs.get('val_accuracy', 0)),
+                    'top2_acc': float(logs.get('top2_acc', 0)),
+                    'val_top2_acc': float(logs.get('val_top2_acc', 0))
+                }
+                training_state['history'].append(history_entry)
+                
+                print(f"✅ Phase {self.phase} Epoch {self.epoch_count}: "
+                      f"loss={logs.get('loss', 0):.4f} acc={logs.get('accuracy', 0):.4f} "
+                      f"val_loss={logs.get('val_loss', 0):.4f} val_acc={logs.get('val_accuracy', 0):.4f}")
+        
+        # المرحلة 1: تدريب الرأس
+        print("\n" + "="*70)
+        print("🔹 PHASE 1: Training classification head")
+        print("="*70)
+        
+        epochs_phase1 = config.get('epochs', 30)
+        callbacks_phase1 = trainer.create_callbacks("best_model_phase1")
+        callbacks_phase1.append(TrainingStateCallback(phase=1))
+        
+        history1 = trainer.train_phase1(
+            model,
+            train_ds_augmented,
+            val_ds_prepared,
+            epochs=epochs_phase1
+        )
+        
+        training_state['model'] = model
+        
+        # المرحلة 2: Fine-tuning
+        print("\n" + "="*70)
+        print("🔹 PHASE 2: Fine-tuning base model")
+        print("="*70)
+        
+        epochs_phase2 = config.get('phase2_epochs', 25)
+        callbacks_phase2 = trainer.create_callbacks("best_model_phase2")
+        callbacks_phase2.append(TrainingStateCallback(phase=2))
+        
+        history2 = trainer.train_phase2(
+            model,
+            base_model,
+            train_ds_augmented,
+            val_ds_prepared,
+            epochs=epochs_phase2
+        )
+        
+        # دمج الـ histories
+        combined_history = EfficientNetV2Trainer.combine_histories(history1, history2)
+        
+        # تقييم النموذج
+        print("\n📈 Evaluating model...")
+        eval_results = trainer.evaluate_model(model, val_ds_prepared)
+        
+        # حفظ النتائج
+        model_save_path = os.path.join(app.config['MODELS_FOLDER'], f'efficientnetv2_{session_id}')
+        os.makedirs(model_save_path, exist_ok=True)
+        model.save(os.path.join(model_save_path, 'model'))
+        
+        # حفظ metadata
+        metadata = {
+            'session_id': session_id,
+            'model_type': 'efficientnetv2',
+            'class_names': class_names,
+            'num_classes': num_classes,
+            'img_size': img_size,
+            'config': config,
+            'eval_results': eval_results,
+            'created_at': time.time()
+        }
+        
+        with open(os.path.join(model_save_path, 'metadata.json'), 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # الحصول على أفضل epoch
+        best_val_acc_idx = np.argmax(combined_history['val_accuracy'])
+        
+        final_results = {
+            'model_type': 'EfficientNetV2',
+            'final_train_accuracy': float(combined_history['accuracy'][-1]),
+            'final_val_accuracy': float(combined_history['val_accuracy'][-1]),
+            'final_train_loss': float(combined_history['loss'][-1]),
+            'final_val_loss': float(combined_history['val_loss'][-1]),
+            'best_epoch': best_val_acc_idx + 1,
+            'best_accuracy': float(max(combined_history['val_accuracy'])),
+            'epochs_completed': len(combined_history['accuracy']),
+            'class_names': class_names,
+            'num_classes': num_classes,
+            'model_path': model_save_path,
+            'has_gradcam': False  # سيتم تحديثه بعد حساب Grad-CAM
+        }
+        
+        training_state['results'] = final_results
+        training_state['status'] = 'completed'
+        training_state['progress'] = 100
+        
+        print("✅ Training completed successfully!")
+        print(f"📊 Final Validation Accuracy: {final_results['final_val_accuracy']:.2%}")
+        print(f"🎯 Best Accuracy: {final_results['best_accuracy']:.2%} at epoch {final_results['best_epoch']}")
+        
+        # حفظ النموذج النهائي
+        training_state['model'] = model
+        
+        # تنظيف الذاكرة
+        import gc
+        gc.collect()
+        
+    except Exception as e:
+        print(f"❌ Training error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        training_state['status'] = 'error'
+        training_state['error_message'] = str(e)
+
+
+def compute_gradcam_background(session_id, model_path):
+    """
+    دالة خلفية لحساب Grad-CAM
+    """
+    try:
+        print("🔮 Computing Grad-CAM...")
+        
+        # تحميل النموذج
+        model = keras.models.load_model(model_path)
+        
+        # تحميل metadata
+        metadata_path = os.path.join(model_path, 'metadata.json')
+        if not os.path.exists(metadata_path):
+            raise Exception("Metadata not found")
+        
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        class_names = metadata.get('class_names', [])
+        extract_path = metadata.get('extract_path')
+        
+        # إذا لم يكن موجود، ابحث عن البيانات الأصلية
+        session_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_session.json")
+        if os.path.exists(session_file):
+            with open(session_file, 'r') as f:
+                session_data = json.load(f)
+            extract_path = session_data.get('preview', {}).get('extract_path')
+        
+        if not extract_path or not os.path.exists(extract_path):
+            raise Exception("Extract path not found for Grad-CAM")
+        
+        # جمع صورة واحدة من كل فئة
+        sample_images = []
+        for class_name in class_names:
+            class_path = os.path.join(extract_path, class_name)
+            if os.path.exists(class_path):
+                images = [f for f in os.listdir(class_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+                if images:
+                    sample_images.append(os.path.join(class_path, images[0]))
+        
+        if not sample_images:
+            raise Exception("No sample images found")
+        
+        print(f"📸 Found {len(sample_images)} sample images")
+        
+        # إنشاء Grad-CAM generator
+        gradcam_gen = GradCAMGenerator(model, class_names, img_size=(256, 256))
+        
+        # إنشاء مجلد الإخراج
+        output_dir = os.path.join(app.config['MODELS_FOLDER'], f'gradcam_{session_id}')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # حساب Grad-CAM
+        gradcam_data = gradcam_gen.generate_gradcam_samples(sample_images, output_dir)
+        
+        if gradcam_data:
+            print(f"✅ Grad-CAM computed successfully! {gradcam_data['num_samples']} samples")
+        else:
+            print("⚠️ Grad-CAM computation had issues")
+        
+        # تحديث حالة التدريب
+        if training_state['results']:
+            training_state['results']['has_gradcam'] = True
+            training_state['results']['gradcam_path'] = output_dir
+        
+    except Exception as e:
+        print(f"❌ Grad-CAM error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+
+
+
+
+
+
 
 @app.route('/api/model-recommendations', methods=['POST'])
 def get_model_recommendations():
