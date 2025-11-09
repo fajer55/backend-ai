@@ -12,6 +12,7 @@ from io import BytesIO
 
 # Import TensorFlow first
 import tensorflow as tf
+from tensorflow import keras
 import numpy as np
 from app.efficientnet_trainer import EfficientNetV2Trainer
 from app.gradcam_generator import GradCAMGenerator
@@ -1361,7 +1362,7 @@ def train_efficientnet_background(config, data_info):
         model = trainer.compile_model(model, learning_rate=config.get('learningRate', 1e-3))
         
         # Callback مخصص لتحديث الحالة
-        class TrainingStateCallback(keras.callbacks.Callback):
+        class TrainingStateCallback(tf.keras.callbacks.Callback):
             def __init__(self, phase):
                 self.phase = phase
                 self.epoch_count = 0
@@ -1510,7 +1511,7 @@ def compute_gradcam_background(session_id, model_path):
         print("🔮 Computing Grad-CAM...")
         
         # تحميل النموذج
-        model = keras.models.load_model(model_path)
+        model = tf.keras.models.load_model(model_path)
         
         # تحميل metadata
         metadata_path = os.path.join(model_path, 'metadata.json')
