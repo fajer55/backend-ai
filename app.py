@@ -1168,9 +1168,21 @@ def train_efficientnet():
             return jsonify({'error': 'Missing configuration or data info'}), 400
         
         # التحقق من أن البيانات صور
-        if data_info.get('data_type') != 'images':
+        # Frontend may send the data type under different keys (data_type, type, or preview.type)
+        data_type = data_info.get('data_type') or data_info.get('type') or (data_info.get('preview') or {}).get('type')
+        if data_type != 'images':
             return jsonify({'error': 'EfficientNetV2 requires image data'}), 400
         
+        # طبع بيانات الطلب للمساعدة في التصحيح
+        print(f"📥 train_efficientnet request received. session preview keys: {list((data_info.get('preview') or {}).keys()) if data_info.get('preview') else 'no preview'}")
+        print(f"📥 config keys: {list(config.keys())}")
+
+        # تحقق مبكر من مسار الاستخراج لكي نُرجع خطأ واضح بدلاً من فشل خفي في الخيط الخلفي
+        session_extract = (data_info.get('preview') or {}).get('extract_path') or data_info.get('extract_path')
+        if not session_extract or not os.path.exists(session_extract):
+            print(f"❌ train_efficientnet - extract_path missing or not accessible: {session_extract}")
+            return jsonify({'error': 'Extract path not found or inaccessible on server', 'provided_extract_path': session_extract}), 400
+
         # إعادة تعيين حالة التدريب
         training_state = {
             'status': 'training',
@@ -1184,12 +1196,18 @@ def train_efficientnet():
         }
         
         # بدء التدريب في thread منفصل
-        training_thread = threading.Thread(
-            target=train_efficientnet_background,
-            args=(config, data_info)
-        )
-        training_thread.daemon = True
-        training_thread.start()
+        try:
+            training_thread = threading.Thread(
+                target=train_efficientnet_background,
+                args=(config, data_info)
+            )
+            training_thread.daemon = True
+            training_thread.start()
+        except Exception as e:
+            print(f"❌ Failed to start training thread: {e}")
+            training_state['status'] = 'error'
+            training_state['error_message'] = str(e)
+            return jsonify({'error': 'Failed to start training', 'details': str(e)}), 500
         
         return jsonify({'message': 'EfficientNetV2 training started successfully'})
     
@@ -1197,6 +1215,19 @@ def train_efficientnet():
         training_state['status'] = 'error'
         training_state['error_message'] = str(e)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/debug/training-state', methods=['GET'])
+def debug_training_state_local():
+    """Return training_state for local debugging only (restricted to localhost)."""
+    remote = request.remote_addr or 'unknown'
+    # Restrict to localhost for safety
+    if remote not in ('127.0.0.1', '::1'):
+        return jsonify({'error': 'Forbidden - debug endpoint available only from localhost', 'remote_addr': remote}), 403
+
+    debug_state = training_state.copy()
+    debug_state.pop('model', None)
+    return jsonify({'debug': True, 'training_state': debug_state, 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/api/compute-gradcam', methods=['POST'])
