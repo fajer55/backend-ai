@@ -22,16 +22,59 @@ class ImageDataLoaderEfficientNet:
     """
     محمل بيانات محسّن لـ EfficientNetV2
     """
-    
+
     def __init__(self, img_size=(256, 256), batch_size=16):
         self.img_size = img_size
         self.batch_size = batch_size
-    
+
+    def clean_image_directory(self, data_dir):
+        """
+        تنظيف المجلد من الصور التالفة أو غير المدعومة
+        """
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+        removed_count = 0
+
+        for root, dirs, files in os.walk(data_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                file_ext = os.path.splitext(file)[1].lower()
+
+                # حذف الملفات غير المدعومة
+                if file_ext not in valid_extensions:
+                    try:
+                        os.remove(file_path)
+                        removed_count += 1
+                        print(f"Removed unsupported file: {file_path}")
+                    except Exception as e:
+                        print(f"Error removing {file_path}: {e}")
+                    continue
+
+                # التحقق من صحة الصورة
+                try:
+                    img = Image.open(file_path)
+                    img.verify()  # التحقق من صحة الصورة
+                    img.close()
+                except Exception as e:
+                    try:
+                        os.remove(file_path)
+                        removed_count += 1
+                        print(f"Removed corrupted image: {file_path} - {e}")
+                    except Exception as remove_error:
+                        print(f"Error removing {file_path}: {remove_error}")
+
+        if removed_count > 0:
+            print(f"✅ Cleaned {removed_count} invalid/corrupted files")
+        return removed_count
+
     def load_image_dataset(self, data_dir, validation_split=0.2, seed=42):
         """
         تحميل مجموعة صور من مجلد
         """
         try:
+            # تنظيف المجلد من الصور التالفة
+            print("🧹 Cleaning image directory...")
+            self.clean_image_directory(data_dir)
+
             # تحميل مجموعة التدريب
             train_ds = tf.keras.utils.image_dataset_from_directory(
                 data_dir,
