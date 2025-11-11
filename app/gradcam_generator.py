@@ -47,7 +47,10 @@ class GradCAMGenerator:
     
     def make_gradcam_heatmap(self, img_preprocessed, pred_class_idx):
         """
-        حساب Grad-CAM heatmap - طريقة مبسطة تعمل مع Rescaling layer
+        حساب Grad-CAM heatmap - باستخدام forward pass يدوي
+
+        المشكلة: لا يمكن إنشاء keras.Model من input إلى طبقة داخل نموذج فرعي
+        الحل: استخدام GradientTape.watch على intermediate outputs
         """
         try:
             # 1. ابحث عن النموذج الفرعي EfficientNet
@@ -78,27 +81,51 @@ class GradCAMGenerator:
                 logger.warning("No suitable conv layer found")
                 return self._simple_saliency_map(img_preprocessed, pred_class_idx)
 
-            # 3. إنشاء grad_model - الآن يجب أن يعمل لأن rescaling layer بسيطة
+            # 3. إنشاء نموذج من EfficientNet input إلى target layer
             try:
-                # احصل على output الطبقة المستهدفة
-                conv_layer_output = efficientnet_layer.get_layer(target_layer_name).output
-
-                grad_model = keras.Model(
-                    inputs=self.model.input,
-                    outputs=[conv_layer_output, self.model.output]
+                # هذا ينجح لأنه داخل نفس النموذج الفرعي
+                conv_model = keras.Model(
+                    inputs=efficientnet_layer.input,
+                    outputs=efficientnet_layer.get_layer(target_layer_name).output
                 )
-                logger.info("Grad-CAM model created successfully")
+                logger.info("Conv extraction model created")
 
             except Exception as e:
-                logger.error(f"Could not create grad_model: {str(e)}")
+                logger.error(f"Could not create conv_model: {str(e)}")
                 return self._simple_saliency_map(img_preprocessed, pred_class_idx)
 
-            # 4. حساب Gradients
-            with tf.GradientTape() as tape:
-                conv_outputs, predictions = grad_model(img_preprocessed, training=False)
+            # 4. حساب Gradients باستخدام forward pass يدوي
+            with tf.GradientTape(persistent=True) as tape:
+                # مرر الصورة خلال الطبقات حتى efficientnet
+                x = img_preprocessed
+                for layer in self.model.layers:
+                    if layer == efficientnet_layer:
+                        break
+                    x = layer(x)
+
+                # الآن x هو input لـ EfficientNet
+                tape.watch(x)
+
+                # احصل على conv outputs
+                conv_outputs = conv_model(x, training=False)
+                tape.watch(conv_outputs)
+
+                # أكمل forward pass
+                y = efficientnet_layer(x, training=False)
+                for layer in self.model.layers:
+                    # ابحث عن الطبقات بعد efficientnet
+                    if hasattr(layer, '_inbound_nodes'):
+                        for node in layer._inbound_nodes:
+                            if any(inp.keras_history[0] == efficientnet_layer for inp in node.input_tensors):
+                                y = layer(y)
+
+                # إذا لم نجد، استخدم الطريقة البسيطة
+                predictions = self.model(img_preprocessed, training=False)
                 class_channel = predictions[:, pred_class_idx]
 
+            # احسب gradients
             grads = tape.gradient(class_channel, conv_outputs)
+            del tape
 
             if grads is None:
                 logger.warning("Gradients are None")
@@ -116,6 +143,8 @@ class GradCAMGenerator:
 
         except Exception as e:
             logger.error(f"Error in Grad-CAM: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return self._simple_saliency_map(img_preprocessed, pred_class_idx)
     
     def _simple_saliency_map(self, img_preprocessed, pred_class_idx):
