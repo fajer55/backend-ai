@@ -1685,7 +1685,7 @@ def train_efficientnet_background(config, data_info):
         try:
             gradcam_thread = threading.Thread(
                 target=compute_gradcam_background,
-                args=(session_id, model_save_path)
+                args=(session_id, os.path.join(model_save_path, 'model'))
             )
             gradcam_thread.daemon = True
             gradcam_thread.start()
