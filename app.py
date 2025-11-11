@@ -44,12 +44,41 @@ training_state = {
     'status': 'idle',  # idle, training, completed, error
     'progress': 0,
     'epoch': 0,
+    'current_phase': 1,  # For EfficientNet two-phase training
     'history': [],
     'model': None,
     'results': None,
     'error_message': None,
+    # إضافة معلومات الـ iterations
+    'current_batch': 0,
+    'total_batches': 0,
+    'batch_loss': 0.0,
+    'batch_accuracy': 0.0,
+    'iteration_details': []
 }
 current_model_tester = None
+
+# ====================================================
+# UTILITY FUNCTIONS
+# ====================================================
+
+def convert_to_json_serializable(obj):
+    """Convert numpy types and other non-serializable types to Python native types"""
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_json_serializable(item) for item in obj]
+    return obj
+
+# ====================================================
+# API ROUTES
+# ====================================================
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -181,17 +210,23 @@ def stop_training():
 def reset_training_state():
     """Reset training state completely"""
     global training_state
-    
+
     training_state = {
         'status': 'idle',
         'progress': 0,
         'epoch': 0,
+        'current_phase': 1,
         'history': [],
         'model': None,
         'results': None,
-        'error_message': None
+        'error_message': None,
+        'current_batch': 0,
+        'total_batches': 0,
+        'batch_loss': 0.0,
+        'batch_accuracy': 0.0,
+        'iteration_details': []
     }
-    
+
     return jsonify({'message': 'Training state reset successfully'})
 
 # تعديل دالة start_training
@@ -262,11 +297,18 @@ def get_training_progress():
     # Create a JSON-serializable copy of training_state
     response_data = {
         'status': training_state['status'],
-        'progress': training_state['progress'],
-        'epoch': training_state['epoch'],
-        'history': training_state['history'],
-        'results': training_state['results'],
-        'error_message': training_state['error_message']
+        'progress': convert_to_json_serializable(training_state['progress']),
+        'epoch': convert_to_json_serializable(training_state['epoch']),
+        'current_phase': convert_to_json_serializable(training_state.get('current_phase', 1)),
+        'history': convert_to_json_serializable(training_state['history']),
+        'results': convert_to_json_serializable(training_state['results']),
+        'error_message': training_state['error_message'],
+        # إضافة تفاصيل الـ iterations
+        'current_batch': convert_to_json_serializable(training_state.get('current_batch', 0)),
+        'total_batches': convert_to_json_serializable(training_state.get('total_batches', 0)),
+        'batch_loss': convert_to_json_serializable(training_state.get('batch_loss', 0.0)),
+        'batch_accuracy': convert_to_json_serializable(training_state.get('batch_accuracy', 0.0)),
+        'iteration_details': convert_to_json_serializable(training_state.get('iteration_details', []))
     }
     # Note: We exclude the 'model' key as it's not JSON serializable
     return jsonify(response_data)
@@ -790,19 +832,61 @@ def train_model_background(config, data_info):
                 super().__init__()
                 self.epoch_count = 0
                 self.start_time = time.time()
-            
+                self.batch_count = 0
+
             def on_epoch_begin(self, epoch, logs=None):
                 print(f"🚀 Starting epoch {epoch + 1}/{config.get('epochs', 50)}")
+                self.batch_count = 0
                 # Force garbage collection at the start of each epoch
                 import gc
                 gc.collect()
-            
+
+            def on_train_begin(self, logs=None):
+                # حساب عدد الـ batches الإجمالي
+                if using_generators and hasattr(X_train, '__len__'):
+                    training_state['total_batches'] = len(X_train)
+                elif hasattr(X_train, 'shape'):
+                    batch_size = config.get('batchSize', 32)
+                    training_state['total_batches'] = int(np.ceil(len(X_train) / batch_size))
+
+            def on_train_batch_end(self, batch, logs=None):
+                logs = logs or {}
+                self.batch_count += 1
+
+                # تحديث معلومات الـ batch الحالي
+                training_state['current_batch'] = self.batch_count
+                training_state['batch_loss'] = float(logs.get('loss', 0))
+                training_state['batch_accuracy'] = float(logs.get('accuracy', 0))
+
+                # الاحتفاظ بآخر 100 iteration فقط لتجنب استهلاك الذاكرة
+                iteration_entry = {
+                    'epoch': self.epoch_count + 1,
+                    'batch': self.batch_count,
+                    'loss': float(logs.get('loss', 0)),
+                    'accuracy': float(logs.get('accuracy', 0))
+                }
+
+                if len(training_state['iteration_details']) >= 100:
+                    training_state['iteration_details'].pop(0)
+                training_state['iteration_details'].append(iteration_entry)
+
+                # طباعة كل 10 batches
+                if self.batch_count % 10 == 0:
+                    total_batches = training_state.get('total_batches', '?')
+                    print(f"   📦 Batch {self.batch_count}/{total_batches}: "
+                          f"loss={logs.get('loss', 0):.4f}, "
+                          f"acc={logs.get('accuracy', 0):.4f}")
+
             def on_epoch_end(self, epoch, logs=None):
                 logs = logs or {}
                 self.epoch_count += 1
                 training_state['epoch'] = self.epoch_count
                 training_state['progress'] = (self.epoch_count / config.get('epochs', 50)) * 100
-                
+
+                # إعادة تعيين batch counter
+                self.batch_count = 0
+                training_state['current_batch'] = 0
+
                 # Add to history
                 history_entry = {
                     'epoch': self.epoch_count,
@@ -812,19 +896,19 @@ def train_model_background(config, data_info):
                     'val_accuracy': float(logs.get('val_accuracy', 0))
                 }
                 training_state['history'].append(history_entry)
-                
+
                 # Calculate ETA
                 elapsed = time.time() - self.start_time
                 epochs_remaining = config.get('epochs', 50) - self.epoch_count
                 eta_seconds = (elapsed / self.epoch_count) * epochs_remaining if self.epoch_count > 0 else 0
-                
+
                 print(f"✅ Epoch {self.epoch_count}: "
                       f"loss={logs.get('loss', 0):.4f}, "
                       f"accuracy={logs.get('accuracy', 0):.4f}, "
                       f"val_loss={logs.get('val_loss', 0):.4f}, "
                       f"val_accuracy={logs.get('val_accuracy', 0):.4f}, "
                       f"ETA: {eta_seconds/60:.1f}min")
-                
+
                 # Periodic memory cleanup
                 if self.epoch_count % 5 == 0:
                     import gc
@@ -1193,7 +1277,12 @@ def train_efficientnet():
             'model': None,
             'results': None,
             'error_message': None,
-            'current_phase': 1
+            'current_phase': 1,
+            'current_batch': 0,
+            'total_batches': 0,
+            'batch_loss': 0.0,
+            'batch_accuracy': 0.0,
+            'iteration_details': []
         }
         
         # بدء التدريب في thread منفصل
@@ -1250,6 +1339,31 @@ def compute_gradcam():
         temp_model_path = os.path.join(app.config['MODELS_FOLDER'], f'temp_model_{session_id}')
         os.makedirs(temp_model_path, exist_ok=True)
         training_state['model'].save(temp_model_path)
+        # حاول كتابة ملف metadata.json بجانب النموذج المؤقت بحيث يمكن لخلفية Grad-CAM قراءته
+        try:
+            temp_metadata = {}
+            # حاول الحصول على المعلومات من training_state.results إن وجدت
+            if training_state.get('results'):
+                res = training_state['results']
+                temp_metadata['class_names'] = res.get('class_names', [])
+                temp_metadata['num_classes'] = res.get('num_classes')
+                # إذا وُجد model_path في النتائج، لا نحاول نسخه الآن
+            # حاول الحصول على extract_path من ملف الجلسة المحفوظ
+            session_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_session.json")
+            if os.path.exists(session_file):
+                with open(session_file, 'r') as sf:
+                    session_data = json.load(sf)
+                extract_path = session_data.get('preview', {}).get('extract_path')
+                if extract_path:
+                    temp_metadata['extract_path'] = extract_path
+
+            # اكتب metadata.json إذا جمعنا أي شيء مفيد
+            if temp_metadata:
+                with open(os.path.join(temp_model_path, 'metadata.json'), 'w') as mf:
+                    json.dump(temp_metadata, mf, indent=2)
+                print(f"✅ Wrote temporary metadata for Grad-CAM at {os.path.join(temp_model_path, 'metadata.json')}")
+        except Exception as e:
+            print(f"⚠️ Could not write temp metadata for Grad-CAM: {e}")
         
         # بدء حساب Grad-CAM في thread
         gradcam_thread = threading.Thread(
@@ -1317,12 +1431,22 @@ def train_efficientnet_background(config, data_info):
         extract_path = data_info.get('preview', {}).get('extract_path')
         if not extract_path or not os.path.exists(extract_path):
             raise Exception("Extract path not found")
-        
+
+        # إصلاح المسار: إذا كان extract_path يحتوي على مجلد واحد فقط، استخدم ذلك المجلد
+        subdirs = [d for d in os.listdir(extract_path) if os.path.isdir(os.path.join(extract_path, d))]
+        if len(subdirs) == 1:
+            # تحقق إذا كان المجلد الفرعي يحتوي على مجلدات أخرى (الأصناف)
+            potential_path = os.path.join(extract_path, subdirs[0])
+            sub_subdirs = [d for d in os.listdir(potential_path) if os.path.isdir(os.path.join(potential_path, d))]
+            if len(sub_subdirs) > 1:
+                print(f"📁 Correcting extract_path from {extract_path} to {potential_path}")
+                extract_path = potential_path
+
         # إعداد البيانات
         img_size = (256, 256)
         batch_size = config.get('batchSize', 16)
         validation_split = config.get('validationSplit', 0.2)
-        
+
         # تحميل البيانات
         train_ds = tf.keras.utils.image_dataset_from_directory(
             extract_path,
@@ -1346,11 +1470,15 @@ def train_efficientnet_background(config, data_info):
         
         class_names = train_ds.class_names
         num_classes = len(class_names)
-        
+
         print(f"📊 Classes: {class_names}")
         print(f"📁 Training samples: {len(train_ds)}")
         print(f"📁 Validation samples: {len(val_ds)}")
-        
+
+        # التحقق من عدد الأصناف
+        if num_classes < 2:
+            raise Exception(f"❌ Found only {num_classes} class. Please ensure your data has the correct folder structure with multiple classes (e.g., glioma, meningioma, pituitary, notumor)")
+
         # تحضير البيانات
         trainer = EfficientNetV2Trainer(img_size=img_size, num_classes=num_classes)
         train_ds_augmented = trainer.prepare_dataset(train_ds, augment=True)
@@ -1360,28 +1488,87 @@ def train_efficientnet_background(config, data_info):
         print("\n🏗️  Building model...")
         model, base_model = trainer.build_model()
         model = trainer.compile_model(model, learning_rate=config.get('learningRate', 1e-3))
-        
+
+        # حذف ملفات .h5 القديمة لتجنب مشاكل الملفات المفتوحة
+        for old_file in ['best_model_phase1.h5', 'best_model_phase2.h5']:
+            if os.path.exists(old_file):
+                try:
+                    os.remove(old_file)
+                    print(f"🗑️  Removed old checkpoint: {old_file}")
+                except Exception as e:
+                    print(f"⚠️  Could not remove {old_file}: {e}")
+
         # Callback مخصص لتحديث الحالة
         class TrainingStateCallback(tf.keras.callbacks.Callback):
-            def __init__(self, phase):
+            def __init__(self, phase, phase1_epochs=0, train_ds=None):
                 self.phase = phase
+                self.phase1_epochs = phase1_epochs  # عدد epochs المرحلة 1 (لحساب الإجمالي في المرحلة 2)
                 self.epoch_count = 0
                 self.start_time = time.time()
-            
+                self.batch_count = 0
+                self.train_ds = train_ds
+
+            def on_epoch_begin(self, epoch, logs=None):
+                self.batch_count = 0
+
+            def on_train_begin(self, logs=None):
+                # حساب عدد الـ batches الإجمالي
+                if self.train_ds and hasattr(self.train_ds, '__len__'):
+                    training_state['total_batches'] = len(self.train_ds)
+
+            def on_train_batch_end(self, batch, logs=None):
+                logs = logs or {}
+                self.batch_count += 1
+
+                # تحديث معلومات الـ batch الحالي
+                training_state['current_batch'] = self.batch_count
+                training_state['batch_loss'] = float(logs.get('loss', 0))
+                training_state['batch_accuracy'] = float(logs.get('accuracy', 0))
+
+                # الاحتفاظ بآخر 100 iteration فقط
+                iteration_entry = {
+                    'epoch': self.epoch_count + 1,
+                    'phase': self.phase,
+                    'batch': self.batch_count,
+                    'loss': float(logs.get('loss', 0)),
+                    'accuracy': float(logs.get('accuracy', 0))
+                }
+
+                if len(training_state['iteration_details']) >= 100:
+                    training_state['iteration_details'].pop(0)
+                training_state['iteration_details'].append(iteration_entry)
+
+                # طباعة كل 10 batches
+                if self.batch_count % 10 == 0:
+                    total_batches = training_state.get('total_batches', '?')
+                    print(f"   📦 Phase {self.phase} Batch {self.batch_count}/{total_batches}: "
+                          f"loss={logs.get('loss', 0):.4f}, "
+                          f"acc={logs.get('accuracy', 0):.4f}")
+
             def on_epoch_end(self, epoch, logs=None):
                 self.epoch_count += 1
                 logs = logs or {}
-                
-                training_state['epoch'] = self.epoch_count
+
+                # إعادة تعيين batch counter
+                self.batch_count = 0
+                training_state['current_batch'] = 0
+
+                # حساب الـ epoch الإجمالي
+                if self.phase == 1:
+                    total_epoch = self.epoch_count
+                else:  # phase 2
+                    total_epoch = self.phase1_epochs + self.epoch_count
+
+                training_state['epoch'] = total_epoch
                 training_state['current_phase'] = self.phase
-                
+
                 # حساب التقدم
-                total_epochs = config.get('epochs', 50)
-                if self.phase == 2:
-                    total_epochs = config.get('epochs', 50) + config.get('phase2_epochs', 25)
-                
-                training_state['progress'] = (training_state['epoch'] / total_epochs) * 100
-                
+                phase1_total = config.get('epochs', 30)
+                phase2_total = config.get('phase2_epochs', 25)
+                total_epochs = phase1_total + phase2_total
+
+                training_state['progress'] = (total_epoch / total_epochs) * 100
+
                 # إضافة إلى history
                 history_entry = {
                     'epoch': training_state['epoch'],
@@ -1394,7 +1581,7 @@ def train_efficientnet_background(config, data_info):
                     'val_top2_acc': float(logs.get('val_top2_acc', 0))
                 }
                 training_state['history'].append(history_entry)
-                
+
                 print(f"✅ Phase {self.phase} Epoch {self.epoch_count}: "
                       f"loss={logs.get('loss', 0):.4f} acc={logs.get('accuracy', 0):.4f} "
                       f"val_loss={logs.get('val_loss', 0):.4f} val_acc={logs.get('val_accuracy', 0):.4f}")
@@ -1406,7 +1593,7 @@ def train_efficientnet_background(config, data_info):
         
         epochs_phase1 = config.get('epochs', 30)
         callbacks_phase1 = trainer.create_callbacks("best_model_phase1")
-        callbacks_phase1.append(TrainingStateCallback(phase=1))
+        callbacks_phase1.append(TrainingStateCallback(phase=1, train_ds=train_ds_augmented))
         
         history1 = trainer.train_phase1(
             model,
@@ -1424,7 +1611,7 @@ def train_efficientnet_background(config, data_info):
         
         epochs_phase2 = config.get('phase2_epochs', 25)
         callbacks_phase2 = trainer.create_callbacks("best_model_phase2")
-        callbacks_phase2.append(TrainingStateCallback(phase=2))
+        callbacks_phase2.append(TrainingStateCallback(phase=2, phase1_epochs=epochs_phase1, train_ds=train_ds_augmented))
         
         history2 = trainer.train_phase2(
             model,
@@ -1450,32 +1637,33 @@ def train_efficientnet_background(config, data_info):
         metadata = {
             'session_id': session_id,
             'model_type': 'efficientnetv2',
-            'class_names': class_names,
-            'num_classes': num_classes,
-            'img_size': img_size,
+            'class_names': list(class_names),
+            'num_classes': int(num_classes),
+            'img_size': list(img_size),
+            'extract_path': extract_path,
             'config': config,
-            'eval_results': eval_results,
+            'eval_results': convert_to_json_serializable(eval_results),
             'created_at': time.time()
         }
-        
+
         with open(os.path.join(model_save_path, 'metadata.json'), 'w') as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(convert_to_json_serializable(metadata), f, indent=2)
         
         # الحصول على أفضل epoch
-        best_val_acc_idx = np.argmax(combined_history['val_accuracy'])
-        
+        best_val_acc_idx = int(np.argmax(combined_history['val_accuracy']))
+
         final_results = {
             'model_type': 'EfficientNetV2',
             'final_train_accuracy': float(combined_history['accuracy'][-1]),
             'final_val_accuracy': float(combined_history['val_accuracy'][-1]),
             'final_train_loss': float(combined_history['loss'][-1]),
             'final_val_loss': float(combined_history['val_loss'][-1]),
-            'best_epoch': best_val_acc_idx + 1,
+            'best_epoch': int(best_val_acc_idx + 1),
             'best_accuracy': float(max(combined_history['val_accuracy'])),
-            'epochs_completed': len(combined_history['accuracy']),
-            'class_names': class_names,
-            'num_classes': num_classes,
-            'model_path': model_save_path,
+            'epochs_completed': int(len(combined_history['accuracy'])),
+            'class_names': list(class_names),
+            'num_classes': int(num_classes),
+            'model_path': str(model_save_path),
             'has_gradcam': False  # سيتم تحديثه بعد حساب Grad-CAM
         }
         
@@ -1493,6 +1681,17 @@ def train_efficientnet_background(config, data_info):
         # تنظيف الذاكرة
         import gc
         gc.collect()
+        # بعد الإنهاء، شغّل حساب Grad-CAM في خلفية آليًا
+        try:
+            gradcam_thread = threading.Thread(
+                target=compute_gradcam_background,
+                args=(session_id, model_save_path)
+            )
+            gradcam_thread.daemon = True
+            gradcam_thread.start()
+            print(f"🔮 Grad-CAM background thread started for session {session_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to start Grad-CAM background thread: {e}")
         
     except Exception as e:
         print(f"❌ Training error: {str(e)}")
@@ -1513,16 +1712,53 @@ def compute_gradcam_background(session_id, model_path):
         # تحميل النموذج
         model = tf.keras.models.load_model(model_path)
         
-        # تحميل metadata
+        # تحميل metadata — حاول داخل model_path، ثم المجلد الأب، ثم مستوى أعلى كاحتياط
         metadata_path = os.path.join(model_path, 'metadata.json')
         if not os.path.exists(metadata_path):
-            raise Exception("Metadata not found")
-        
+            parent_dir = os.path.dirname(model_path)
+            alt_metadata_path = os.path.join(parent_dir, 'metadata.json')
+            if os.path.exists(alt_metadata_path):
+                metadata_path = alt_metadata_path
+            else:
+                # حاول مستوى أعلى (مثلاً عندما يكون model_path endswith 'model')
+                grandparent_dir = os.path.dirname(parent_dir)
+                alt2 = os.path.join(grandparent_dir, 'metadata.json')
+                if os.path.exists(alt2):
+                    metadata_path = alt2
+                else:
+                    raise Exception("Metadata not found")
+
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
-        
+
+        print(f"🔎 Using metadata file: {metadata_path}")
+
         class_names = metadata.get('class_names', [])
         extract_path = metadata.get('extract_path')
+
+        # إذا لم توجد أسماء الأصناف في metadata، حاول الحصول عليها من training_state أو من مجلد النماذج النهائي
+        if not class_names:
+            alt_names = None
+            try:
+                alt_names = training_state.get('results', {}).get('class_names')
+            except Exception:
+                alt_names = None
+
+            if alt_names:
+                class_names = alt_names
+                print("ℹ️ Filled class_names from training_state.results")
+            else:
+                # حاول تحميل metadata من trained_models/efficientnetv2_{session_id}/metadata.json
+                trained_meta = os.path.join(app.config['MODELS_FOLDER'], f'efficientnetv2_{session_id}', 'metadata.json')
+                if os.path.exists(trained_meta):
+                    try:
+                        with open(trained_meta, 'r') as tfm:
+                            tm = json.load(tfm)
+                        class_names = tm.get('class_names', [])
+                        if class_names:
+                            print(f"ℹ️ Filled class_names from {trained_meta}")
+                    except Exception:
+                        pass
         
         # إذا لم يكن موجود، ابحث عن البيانات الأصلية
         session_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_session.json")
@@ -1542,7 +1778,48 @@ def compute_gradcam_background(session_id, model_path):
                 images = [f for f in os.listdir(class_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
                 if images:
                     sample_images.append(os.path.join(class_path, images[0]))
-        
+
+        # Fallback: إذا لم نعثر على أي صور من خلال بنية المجلد المتوقعة، قم ببحث تكراري داخل extract_path
+        if not sample_images:
+            print("⚠️ No images found in class subfolders — performing recursive search in extract_path...")
+            found = {}
+            for root, dirs, files in os.walk(extract_path):
+                for fn in files:
+                    if fn.lower().endswith(('.jpg', '.png', '.jpeg')):
+                        full = os.path.join(root, fn)
+                        # محاولة مطابقة اسم الفئة من مسار الدليل الأب
+                        parent = os.path.basename(os.path.dirname(full))
+                        # normalise comparison
+                        for cname in class_names:
+                            if cname.lower() == parent.lower():
+                                if cname not in found:
+                                    found[cname] = full
+                        # احتفظ ببعض الصور العامة إذا لم نجد مطابقة
+                        if len(found) >= len(class_names):
+                            break
+                if len(found) >= len(class_names):
+                    break
+
+            # إذا وجدنا مطابقات، أضفها إلى sample_images
+            if found:
+                for cname in class_names:
+                    if cname in found:
+                        sample_images.append(found[cname])
+
+            # كحل أخير، إذا ما زال فارغًا، التقط بعض الصور من أي مكان داخل extract_path
+            if not sample_images:
+                any_images = []
+                for root, dirs, files in os.walk(extract_path):
+                    for fn in files:
+                        if fn.lower().endswith(('.jpg', '.png', '.jpeg')):
+                            any_images.append(os.path.join(root, fn))
+                    if any_images:
+                        break
+                # اختر حتى  min( len(class_names), len(any_images) ) صور
+                if any_images:
+                    limit = min(len(class_names) if class_names else 4, len(any_images))
+                    sample_images = any_images[:limit]
+
         if not sample_images:
             raise Exception("No sample images found")
         

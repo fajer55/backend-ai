@@ -47,12 +47,12 @@ class EfficientNetV2Trainer:
     
     def build_model(self):
         """
-        بناء نموذج EfficientNetV2L مع رأس تصنيف
+        بناء نموذج EfficientNetV2B0 مع رأس تصنيف
         """
-        logger.info("Building EfficientNetV2L model...")
-        
-        # تحميل Base Model
-        base_model = tf.keras.applications.EfficientNetV2L(
+        logger.info("Building EfficientNetV2B0 model...")
+
+        # تحميل Base Model - B0 أصغر بكثير من L
+        base_model = tf.keras.applications.EfficientNetV2B0(
             weights="imagenet",
             include_top=False,
             input_shape=self.img_size + (3,)
@@ -64,7 +64,7 @@ class EfficientNetV2Trainer:
         # بناء النموذج الكامل
         inputs = keras.Input(shape=self.img_size + (3,))
         
-        # Preprocessing
+        # Preprocessing - using B0 preprocessing
         x = tf.keras.applications.efficientnet_v2.preprocess_input(inputs)
         
         # Base model
@@ -119,10 +119,11 @@ class EfficientNetV2Trainer:
                 verbose=1
             ),
             keras.callbacks.ModelCheckpoint(
-                f'{model_name}.keras',
+                f'{model_name}.h5',
                 save_best_only=True,
                 monitor='val_accuracy',
-                verbose=1
+                verbose=1,
+                save_format='h5'
             )
         ]
         return callbacks
@@ -161,7 +162,7 @@ class EfficientNetV2Trainer:
         
         # تجميد الطبقات الأولى فقط
         if fine_tune_at is None:
-            fine_tune_at = len(base_model.layers) - 50  # فك آخر 50 طبقة
+            fine_tune_at = len(base_model.layers) - 30  # فك آخر 30 طبقة (B0 أصغر من L)
         
         for layer in base_model.layers[:fine_tune_at]:
             layer.trainable = False
