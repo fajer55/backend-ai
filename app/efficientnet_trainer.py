@@ -10,11 +10,14 @@ logger = logging.getLogger(__name__)
 class EfficientNetV2Trainer:
     """
     🧠 EfficientNetV2 Trainer for Brain Tumor Classification
+    ✨ Updated to match 97% accuracy Colab implementation
     """
-    
-    def __init__(self, img_size=(256, 256), num_classes=4):
+
+    def __init__(self, img_size=(256, 256), num_classes=4, model_type='efficientnetv2l'):
         self.img_size = img_size
         self.num_classes = num_classes
+        self.model_type = model_type  # 'efficientnetv2l', 'efficientnetv2b0', 'resnet152v2', 'convnext'
+        self.preprocess_fn = None  # سيتم تعيينه في build_model
     
     def create_data_augmentation(self):
         """
@@ -47,19 +50,67 @@ class EfficientNetV2Trainer:
     
     def build_model(self):
         """
-        بناء نموذج EfficientNetV2B0 مع رأس تصنيف
+        بناء نموذج محسّن مع دعم نماذج متعددة
+        ✅ يطابق كود Colab تماماً (97% accuracy)
 
-        ملاحظة مهمة: لا نستخدم preprocessing داخل النموذج لتمكين Grad-CAM.
-        Preprocessing يتم تطبيقه في preprocessing pipeline خارجياً.
+        Supported models:
+        - efficientnetv2, efficientnetv2l: EfficientNetV2-L (أفضل دقة - 480M params)
+        - efficientnetv2b0: EfficientNetV2-B0 (أسرع - 21M params)
+        - resnet152v2: ResNet152V2 (قوي للصور الطبية)
+        - convnext: ConvNeXtLarge (حديث وفعال)
         """
-        logger.info("Building EfficientNetV2B0 model...")
+        logger.info(f"Building {self.model_type.upper()} model...")
 
-        # تحميل Base Model - B0 أصغر بكثير من L
-        base_model = tf.keras.applications.EfficientNetV2B0(
-            weights="imagenet",
-            include_top=False,
-            input_shape=self.img_size + (3,)
-        )
+        # ✅ معالجة القيم من Frontend (fallback ذكي)
+        model_type_normalized = self.model_type.lower()
+
+        # إذا Frontend أرسل 'efficientnetv2' فقط، استخدم 'L' افتراضياً
+        if model_type_normalized == 'efficientnetv2':
+            model_type_normalized = 'efficientnetv2l'
+            logger.info(f"   📝 Auto-corrected 'efficientnetv2' → 'efficientnetv2l'")
+
+        # ✅ اختيار النموذج حسب model_type
+        if model_type_normalized in ['efficientnetv2l', 'efficientnetv2-l']:
+            base_model = tf.keras.applications.EfficientNetV2L(
+                weights="imagenet",
+                include_top=False,
+                input_shape=self.img_size + (3,)
+            )
+            self.preprocess_fn = tf.keras.applications.efficientnet_v2.preprocess_input
+
+        elif model_type_normalized in ['efficientnetv2b0', 'efficientnetv2-b0']:
+            base_model = tf.keras.applications.EfficientNetV2B0(
+                weights="imagenet",
+                include_top=False,
+                input_shape=self.img_size + (3,)
+            )
+            self.preprocess_fn = tf.keras.applications.efficientnet_v2.preprocess_input
+
+        elif model_type_normalized in ['resnet152v2', 'resnet152-v2', 'resnet']:
+            base_model = tf.keras.applications.ResNet152V2(
+                weights="imagenet",
+                include_top=False,
+                input_shape=self.img_size + (3,)
+            )
+            self.preprocess_fn = tf.keras.applications.resnet_v2.preprocess_input
+
+        elif model_type_normalized in ['convnext', 'convnextlarge']:
+            base_model = tf.keras.applications.ConvNeXtLarge(
+                weights="imagenet",
+                include_top=False,
+                input_shape=self.img_size + (3,)
+            )
+            self.preprocess_fn = tf.keras.applications.convnext.preprocess_input
+        else:
+            # Fallback: استخدم EfficientNetV2L افتراضياً
+            logger.warning(f"⚠️  Unknown model_type '{self.model_type}', using EfficientNetV2L as default")
+            base_model = tf.keras.applications.EfficientNetV2L(
+                weights="imagenet",
+                include_top=False,
+                input_shape=self.img_size + (3,)
+            )
+            self.preprocess_fn = tf.keras.applications.efficientnet_v2.preprocess_input
+            model_type_normalized = 'efficientnetv2l'
 
         # تجميد الطبقات في البداية
         base_model.trainable = False
@@ -67,13 +118,8 @@ class EfficientNetV2Trainer:
         # بناء النموذج الكامل
         inputs = keras.Input(shape=self.img_size + (3,))
 
-        # ❌ لا نستخدم preprocess_input هنا!
-        # ✅ سيتم التطبيق في data pipeline
-        # x = tf.keras.applications.efficientnet_v2.preprocess_input(inputs)
-
-        # Rescaling manual (بدلاً من preprocess_input)
-        # EfficientNet preprocessing: scale to [-1, 1]
-        x = layers.Rescaling(scale=1./127.5, offset=-1)(inputs)
+        # ✅ استخدام preprocess_input الرسمي (كما في Colab)
+        x = self.preprocess_fn(inputs)
 
         # Base model
         x = base_model(x, training=False)
@@ -81,7 +127,7 @@ class EfficientNetV2Trainer:
         # Global Average Pooling
         x = layers.GlobalAveragePooling2D()(x)
 
-        # رأس التصنيف
+        # ✅ رأس التصنيف (نفس Colab تماماً)
         x = layers.BatchNormalization()(x)
         x = layers.Dropout(0.5)(x)
         x = layers.Dense(512, activation="relu")(x)
@@ -93,7 +139,16 @@ class EfficientNetV2Trainer:
 
         model = keras.Model(inputs, outputs)
 
-        logger.info("Model built successfully (Grad-CAM compatible)!")
+        # تحديث model_type للاستخدام في fine-tuning
+        self.model_type = model_type_normalized
+
+        # طباعة معلومات النموذج
+        total_params = model.count_params()
+        logger.info(f"✅ Model built successfully!")
+        logger.info(f"   Model: {model_type_normalized.upper()}")
+        logger.info(f"   Total Parameters: {total_params:,}")
+        logger.info(f"   Trainable Parameters: {sum([tf.size(w).numpy() for w in model.trainable_weights]):,}")
+
         return model, base_model
     
     def compile_model(self, model, learning_rate=1e-3):
@@ -160,22 +215,27 @@ class EfficientNetV2Trainer:
     def train_phase2(self, model, base_model, train_ds, val_ds, epochs=25, fine_tune_at=None):
         """
         المرحلة الثانية: Fine-tuning آخر طبقات Base Model
+        ✅ محدث ليطابق Colab (50 طبقة للنماذج الكبيرة)
         """
         logger.info("="*70)
         logger.info("🔹 PHASE 2: Fine-tuning last layers...")
         logger.info("="*70)
-        
+
         # فك التجميد
         base_model.trainable = True
-        
-        # تجميد الطبقات الأولى فقط
+
+        # ✅ تجميد الطبقات الأولى فقط (محدث حسب نوع النموذج)
         if fine_tune_at is None:
-            fine_tune_at = len(base_model.layers) - 30  # فك آخر 30 طبقة (B0 أصغر من L)
-        
+            # للنماذج الكبيرة (L, ResNet152, ConvNeXt) -> فك 50 طبقة
+            if self.model_type in ['efficientnetv2l', 'resnet152v2', 'convnext']:
+                fine_tune_at = len(base_model.layers) - 50
+            else:  # B0 وغيره
+                fine_tune_at = len(base_model.layers) - 30
+
         for layer in base_model.layers[:fine_tune_at]:
             layer.trainable = False
-        
-        logger.info(f"Unfreezing {len(base_model.layers) - fine_tune_at} layers")
+
+        logger.info(f"Unfreezing {len(base_model.layers) - fine_tune_at} layers (out of {len(base_model.layers)})")
         
         # إعادة ضبط بمعدل تعلم أقل
         model.compile(
